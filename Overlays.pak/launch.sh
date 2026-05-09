@@ -33,7 +33,13 @@ export PATH="$PAK_DIR/bin/$PLATFORM:$PAK_DIR/bin/$ARCH:$PAK_DIR/bin/shared:$HOME
 # Working dir for transient artifacts (tree.json, preview images)
 WORK_DIR="$(mktemp -d 2>/dev/null || echo "/tmp/${PAK_NAME}.$$")"
 mkdir -p "$WORK_DIR"
-trap 'rm -rf "$WORK_DIR"' EXIT INT TERM
+
+cleanup() { rm -rf "$WORK_DIR"; }
+trap cleanup EXIT
+# Without an explicit exit, POSIX sh resumes the loop after the trap fires,
+# which is why a system shutdown was bouncing back into the pak menu.
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM HUP
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -42,6 +48,25 @@ trap 'rm -rf "$WORK_DIR"' EXIT INT TERM
 REPO_USER="LoveRetro"
 REPO_NAME="nextui-community-overlays"
 REPO_BRANCH="main"
+
+# Many handhelds (Trimui Brick, etc.) ship without a CA bundle, so curl can't
+# verify any HTTPS endpoint. The data we pull is public and pinned to known
+# hosts (api.github.com, raw.githubusercontent.com, github.com releases), so
+# the practical risk of skipping verification is minimal. If a CA bundle is
+# present we still prefer it.
+CURL="curl -fsSL --connect-timeout 15 --max-time 180"
+for ca in /etc/ssl/certs/ca-certificates.crt \
+          /etc/pki/tls/certs/ca-bundle.crt \
+          /etc/ssl/cert.pem; do
+  if [ -f "$ca" ]; then
+    CURL="$CURL --cacert $ca"
+    HAS_CA=1
+    break
+  fi
+done
+if [ -z "$HAS_CA" ]; then
+  CURL="$CURL --insecure"
+fi
 
 TREE_API="https://api.github.com/repos/${REPO_USER}/${REPO_NAME}/git/trees/${REPO_BRANCH}?recursive=1"
 RAW_BASE="https://raw.githubusercontent.com/${REPO_USER}/${REPO_NAME}/${REPO_BRANCH}"
@@ -127,7 +152,7 @@ ensure_minui_binary() {
   # Try to download a prebuilt for our platform tag
   url="${release_base}/${bin_name}-${MINUI_BIN_TAG}"
   echo "Fetching $bin_name from $url"
-  if curl -fsSL --connect-timeout 10 --max-time 120 -o "$local_target.tmp" "$url"; then
+  if $CURL -o "$local_target.tmp" "$url"; then
     chmod +x "$local_target.tmp"
     mv "$local_target.tmp" "$local_target"
     return 0
@@ -149,15 +174,21 @@ ensure_helpers() {
 # UI wrappers
 # ---------------------------------------------------------------------------
 
-# Show a list and return the chosen line on stdout. Sets $LIST_RC to exit code.
+# Single global output sink for show_list. We deliberately avoid command
+# substitution ($(show_list ...)) because POSIX runs that in a subshell, which
+# means any variable a function sets - including the helper's exit code -
+# vanishes the moment the subshell ends. Instead the function writes its
+# selection to LIST_OUT_FILE and the caller cats that, while $? carries the
+# real exit code straight back.
+LIST_OUT_FILE="$WORK_DIR/list.out"
+
 show_list() {
   title="$1"
   items_file="$2"
   confirm_text="${3:-SELECT}"
   cancel_text="${4:-BACK}"
 
-  out_file="$WORK_DIR/list.out"
-  : >"$out_file"
+  : >"$LIST_OUT_FILE"
 
   if [ "$HELPERS_OK" = "1" ] && command -v minui-list >/dev/null 2>&1; then
     minui-list \
@@ -166,22 +197,40 @@ show_list() {
       --title "$title" \
       --confirm-text "$confirm_text" \
       --cancel-text "$cancel_text" \
-      --write-location "$out_file"
-    LIST_RC=$?
+      --write-location "$LIST_OUT_FILE"
+    return $?
   else
     # Plain-tty fallback so the script is at least scriptable from SSH
-    echo "[$title]"
-    nl -ba "$items_file"
-    printf "Pick a number (empty = back): "
+    echo "[$title]" >&2
+    nl -ba "$items_file" >&2
+    printf "Pick a number (empty = back): " >&2
     read -r pick
     if [ -z "$pick" ]; then
-      LIST_RC=2
-    else
-      sed -n "${pick}p" "$items_file" >"$out_file"
-      LIST_RC=0
+      return 2
     fi
+    sed -n "${pick}p" "$items_file" >"$LIST_OUT_FILE"
+    return 0
   fi
-  cat "$out_file"
+}
+
+# Map an exit code from a helper into one of three actions.
+# Sets HELPER_ACTION to: ok | back | abort
+# `abort` covers everything that is not a successful select / back press
+# (segfault, kill, sigint/sigterm, etc.) - the caller should `exit "$rc"`.
+classify_helper_rc() {
+  rc="$1"
+  case "$rc" in
+    0|4) HELPER_ACTION=ok ;;
+    2|3) HELPER_ACTION=back ;;
+    130|143|124) HELPER_ACTION=abort ;;
+    *)
+      if [ "$rc" -ge 128 ] 2>/dev/null; then
+        HELPER_ACTION=abort
+      else
+        HELPER_ACTION=back
+      fi
+      ;;
+  esac
 }
 
 # Show a single message screen. $MSG_RC holds exit code.
@@ -202,29 +251,53 @@ show_message() {
   return 0
 }
 
-# Fullscreen preview of an image with Install / Back actions.
-# Returns 4 if user pressed A (install), 2 if pressed B (back).
+# Fullscreen preview of an image. Returns:
+#   0   -> user pressed A (INSTALL)
+#   2   -> user pressed B (BACK)
+#   130/143/>=128 -> shutdown / crash / etc. (caller should propagate)
+# We deliberately keep A as the *confirm* button rather than wiring it as an
+# extra action button. minui-presenter rejects A being assigned twice (default
+# confirm-button=A, default action-button=none); the previous version sent
+# both --confirm + --action on A and minui-presenter exited 1 immediately,
+# producing the "black flash, back to list" behaviour.
 show_preview() {
   img_path="$1"
   caption="$2"
 
-  if [ "$HELPERS_OK" = "1" ] && command -v minui-presenter >/dev/null 2>&1; then
-    minui-presenter \
-      --background-image "$img_path" \
-      --message "$caption" \
-      --message-alignment bottom \
-      --show-pill \
-      --action-button A --action-text "INSTALL" --action-show \
-      --cancel-button B --cancel-text "BACK"   --cancel-show \
-      --timeout 0
-    PREV_RC=$?
-  else
-    echo "[preview] $caption -> $img_path"
-    printf "Install? (y/N): "
-    read -r ans
-    case "$ans" in y|Y) PREV_RC=4 ;; *) PREV_RC=2 ;; esac
+  ls -l "$img_path" 2>&1 || true
+  if command -v file >/dev/null 2>&1; then
+    file "$img_path" 2>&1 || true
   fi
-  return 0
+
+  if [ "$HELPERS_OK" = "1" ] && command -v minui-presenter >/dev/null 2>&1; then
+    json_file="$WORK_DIR/preview.json"
+    safe_caption=$(echo "$caption" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+    # Caption at the top so the bottom A/B button hints stay readable.
+    cat > "$json_file" <<EOF
+{
+  "items": [
+    {
+      "text": "${safe_caption}",
+      "background_image": "${img_path}",
+      "alignment": "top",
+      "show_pill": true
+    }
+  ]
+}
+EOF
+
+    minui-presenter \
+      --file "$json_file" \
+      --confirm-button A --confirm-text "INSTALL" --confirm-show \
+      --cancel-button  B --cancel-text  "BACK"    --cancel-show \
+      --timeout 0
+    return $?
+  fi
+
+  echo "[preview] $caption -> $img_path"
+  printf "Install? (y/N): "
+  read -r ans
+  case "$ans" in y|Y) return 0 ;; *) return 2 ;; esac
 }
 
 # ---------------------------------------------------------------------------
@@ -236,9 +309,8 @@ PATHS_FILE="$WORK_DIR/paths.txt"
 
 fetch_tree() {
   echo "Fetching repository tree..."
-  if ! curl -fsSL --connect-timeout 15 --max-time 60 \
-        -H "Accept: application/vnd.github.v3+json" \
-        -o "$TREE_FILE" "$TREE_API"; then
+  if ! $CURL -H "Accept: application/vnd.github.v3+json" \
+              -o "$TREE_FILE" "$TREE_API"; then
     return 1
   fi
 
@@ -277,14 +349,38 @@ list_overlays_for_system() {
 }
 
 # Convert a repo path like "GB/720p/KrutzOtrem/aspect/Aspect - Vanilla.png"
-# into a friendly label "KrutzOtrem / aspect / Aspect - Vanilla".
+# into a short friendly label.
+# Strategy: drop CORE/RES, keep the bare filename, strip a redundant subdir
+# prefix (e.g. "aspect/Aspect - Vanilla" -> "Vanilla"), append "[Author]".
+# minui-list has no horizontal scrolling, so short labels matter.
 pretty_label_for_path() {
   full="$1"
-  # strip CORE/RES/
   rest=$(echo "$full" | sed -E 's#^[^/]+/[^/]+/##')
-  # drop extension (case-insensitive without the GNU 'I' flag for busybox compat)
-  base=$(echo "$rest" | sed -E 's/\.(png|PNG|jpg|JPG|jpeg|JPEG)$//')
-  echo "$base" | sed 's#/# / #g'
+  author=$(echo "$rest" | awk -F/ '{print $1}')
+  remainder=$(echo "$rest" | sed -E 's#^[^/]+/##')
+  # remainder = subdir/.../filename (subdir may be empty)
+  filename=$(echo "$remainder" | awk -F/ '{print $NF}')
+  subdir=$(echo "$remainder" | awk -F/ '{ if (NF>1) {
+              s=$1; for (i=2;i<NF;i++) s=s"/"$i; print s
+            } else print "" }')
+  base=$(echo "$filename" | sed -E 's/\.(png|PNG|jpg|JPG|jpeg|JPEG)$//')
+
+  # If filename starts with the subdir name (case-insensitive) followed by
+  # " - " or "_", strip that prefix - it's redundant context.
+  if [ -n "$subdir" ]; then
+    leaf=$(basename "$subdir")
+    short=$(echo "$base" | awk -v p="$leaf" '
+      BEGIN { lp=tolower(p) }
+      {
+        s=$0; ls=tolower(s);
+        if (substr(ls,1,length(lp)+3)==lp" - ") print substr(s,length(lp)+4);
+        else if (substr(ls,1,length(lp)+1)==lp"_") print substr(s,length(lp)+2);
+        else print s
+      }')
+    echo "${short} [${author}]"
+  else
+    echo "${base} [${author}]"
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -302,42 +398,173 @@ dest_filename_for_path() {
 download_repo_file() {
   src="$1"; dst="$2"
   url="${RAW_BASE}/$(echo "$src" | sed 's# #%20#g')"
-  curl -fsSL --connect-timeout 15 --max-time 180 -o "$dst.tmp" "$url" || return 1
+  $CURL -o "$dst.tmp" "$url" || return 1
   mv "$dst.tmp" "$dst"
   return 0
 }
 
+# Newer NextUI builds (v6.7+) look for /Overlays/<RES>/<CORE>/*.png so they
+# can ship overlays per resolution. Older builds look for /Overlays/<CORE>/.
+# We don't know which is in use, and the right answer differs by core (e.g.
+# GBC may already work in the legacy path while GBA needs the new one), so
+# we just install to both locations. install_one_dir handles a single target.
+install_one_dir() {
+  dest_dir="$1"
+  src_repo_path="$2"
+  cfg_src_repo_path="$3"   # may be empty
+  unique_stem="$4"
+  ext="$5"
+
+  mkdir -p "$dest_dir" || return 1
+  dest_png="$dest_dir/${unique_stem}.${ext}"
+  dest_cfg="$dest_dir/${unique_stem}.cfg"
+
+  if ! download_repo_file "$src_repo_path" "$dest_png"; then
+    return 1
+  fi
+  echo "INSTALL  $dest_png  ($(stat -c %s "$dest_png" 2>/dev/null || wc -c <"$dest_png") bytes)"
+
+  png_basename=$(basename "$dest_png")
+
+  if [ -n "$cfg_src_repo_path" ]; then
+    # The repo provided an explicit cfg - pull it and rewrite the
+    # overlayN_overlay = ... line to point at our renamed PNG.
+    if download_repo_file "$cfg_src_repo_path" "$dest_cfg"; then
+      escaped_basename=$(echo "$png_basename" | sed -e 's/[\/&]/\\&/g')
+      sed -E "s|^([[:space:]]*overlay[0-9]+_overlay[[:space:]]*=[[:space:]]*).*$|\1${escaped_basename}|" \
+        "$dest_cfg" > "${dest_cfg}.tmp" && mv "${dest_cfg}.tmp" "$dest_cfg"
+      echo "INSTALL  $dest_cfg  (from repo)"
+      return 0
+    fi
+  fi
+
+  # No sibling .cfg in the repo (lots of authors only ship the PNG).
+  # libretro/minarch needs a .cfg to actually load an overlay, otherwise
+  # NextUI will not list it under Options -> Frontend -> Overlay.
+  # Synthesise a minimal full-screen overlay config matching the format
+  # used elsewhere in the same repo (Perfect_DMG-EX.cfg etc).
+  cat >"$dest_cfg" <<EOF
+overlays = 1
+overlay0_overlay = ${png_basename}
+overlay0_full_screen = true
+overlay0_descs = 0
+EOF
+  echo "INSTALL  $dest_cfg  (auto-generated)"
+  return 0
+}
+
+# Repo organises overlays by the *system* the artwork was made for (GBA, GB,
+# FC, ...), but NextUI maps roms to paks by the *tag* in the rom folder name
+# (Game Boy Advance (MGBA) -> MGBA.pak -> /Overlays/MGBA/). When the user has
+# only an alternate-core pak (e.g. MGBA but no GBA.pak), installing into
+# /Overlays/GBA/ does nothing visible in-game.
+#
+# expand_system_to_tags returns every alias for the given repo system that is
+# actually present on this device, by checking for either:
+#   - /Emus/<platform>/<TAG>.pak   (the emulator pak is installed), or
+#   - /Roms/* (<TAG>)              (a rom folder uses that tag).
+# If nothing matches we fall back to the original system name so we still
+# write something useful.
+expand_system_to_tags() {
+  sys="$1"
+  case "$sys" in
+    GBA)    cands="GBA MGBA GPSP VBA VBANEXT" ;;
+    GB)     cands="GB GAMBATTE SAMEBOY MGB" ;;
+    GBC)    cands="GBC GAMBATTE SAMEBOY MGB" ;;
+    SGB)    cands="SGB" ;;
+    FC)     cands="FC NES FCEUMM NESTOPIA QUICKNES" ;;
+    FDS)    cands="FDS NES FCEUMM NESTOPIA" ;;
+    SFC)    cands="SFC SNES SNES9X SUPA" ;;
+    MD)     cands="MD GEN GENESIS PICODRIVE BLASTEM" ;;
+    SMS)    cands="SMS PICODRIVE" ;;
+    GG)     cands="GG PICODRIVE" ;;
+    SEGACD) cands="SEGACD GENESISPLUSGX PICODRIVE" ;;
+    PCE)    cands="PCE TGFX BEETLEPCE" ;;
+    NGP)    cands="NGP MEDNAFEN" ;;
+    NGPC)   cands="NGPC MEDNAFEN" ;;
+    A2600)  cands="A2600 STELLA" ;;
+    A5200)  cands="A5200 ATARI800" ;;
+    A7800)  cands="A7800 PROSYSTEM" ;;
+    LYNX)   cands="LYNX HANDY MEDNAFENLYNX" ;;
+    VB)     cands="VB MEDNAFENVB BEETLEVB" ;;
+    PRBOOM) cands="PRBOOM DOOM" ;;
+    PS)     cands="PS PSX PCSXREARMED DUCKSTATION SWANSTATION" ;;
+    P8)     cands="P8" ;;
+    PKM)    cands="PKM PMINI POKEMINI" ;;
+    C64)    cands="C64 VICEX64" ;;
+    C128)   cands="C128 VICEX128" ;;
+    PLUS4)  cands="PLUS4 VICEXPLUS4" ;;
+    VIC)    cands="VIC VIC20 VICEXVIC" ;;
+    PET)    cands="PET VICEXPET" ;;
+    MSX)    cands="MSX BLUEMSX FMSX" ;;
+    AMIGA)  cands="AMIGA PUAE" ;;
+    COLECO) cands="COLECO COLECOVISION BLUEMSX" ;;
+    CPC)    cands="CPC CRUDE" ;;
+    GENERIC) cands="GENERIC" ;;
+    *)      cands="$sys" ;;
+  esac
+
+  emu_dir="${SDCARD_PATH:-/mnt/SDCARD}/Emus/${PLATFORM:-tg5040}"
+  rom_dir="${SDCARD_PATH:-/mnt/SDCARD}/Roms"
+
+  active=""
+  for c in $cands; do
+    found=0
+    if [ -d "$emu_dir/${c}.pak" ]; then
+      found=1
+    else
+      for d in "$rom_dir"/*"(${c})"; do
+        [ -d "$d" ] && { found=1; break; }
+      done
+    fi
+    if [ "$found" = "1" ]; then
+      active="$active $c"
+    fi
+  done
+  active="${active# }"
+
+  # If we found nothing on the device, still install under the original name -
+  # at worst the overlay sits unused, but at best the user installs the
+  # matching pak later and it lights up.
+  if [ -z "$active" ]; then
+    active="$sys"
+  fi
+  echo "$active"
+}
+
 install_overlay() {
-  repo_path="$1"  # e.g. GB/720p/KrutzOtrem/aspect/Aspect - Vanilla.png
+  repo_path="$1"  # e.g. GBA/768p/KrutzOtrem/aspect/Aspect - Vanilla.png
   system=$(echo "$repo_path" | awk -F/ '{print $1}')
+  res=$(echo    "$repo_path" | awk -F/ '{print $2}')
   base=$(basename "$repo_path")
   ext="${base##*.}"
   stem="${base%.*}"
 
-  dest_dir="$OVERLAYS_ROOT/$system"
-  mkdir -p "$dest_dir"
-
   unique_stem=$(dest_filename_for_path "$repo_path" | sed -E 's/\.(png|PNG|jpg|JPG|jpeg|JPEG)$//')
-  dest_png="$dest_dir/${unique_stem}.${ext}"
 
-  # Download the image
-  if ! download_repo_file "$repo_path" "$dest_png"; then
-    return 1
-  fi
-
-  # If a sibling .cfg exists, fetch it and rewrite its overlayN_overlay reference
   cfg_repo_path=$(dirname "$repo_path")/"${stem}.cfg"
-  if grep -Fxq "$cfg_repo_path" "$PATHS_FILE"; then
-    dest_cfg="$dest_dir/${unique_stem}.cfg"
-    if download_repo_file "$cfg_repo_path" "$dest_cfg"; then
-      # Update the overlayN_overlay = ... line(s) to point at our renamed PNG.
-      # Busybox sed lacks portable -i.bak, so rewrite via temp file.
-      escaped_basename=$(basename "$dest_png" | sed -e 's/[\/&]/\\&/g')
-      sed -E "s|^([[:space:]]*overlay[0-9]+_overlay[[:space:]]*=[[:space:]]*).*$|\1${escaped_basename}|" \
-        "$dest_cfg" > "${dest_cfg}.tmp" && mv "${dest_cfg}.tmp" "$dest_cfg"
-    fi
+  if ! grep -Fxq "$cfg_repo_path" "$PATHS_FILE"; then
+    cfg_repo_path=""
   fi
 
+  tags=$(expand_system_to_tags "$system")
+  echo "INSTALL  system=$system tags='$tags' res=$res"
+
+  ok=0
+  installed_human=""
+  for tag in $tags; do
+    if install_one_dir "$OVERLAYS_ROOT/$tag" "$repo_path" "$cfg_repo_path" "$unique_stem" "$ext"; then
+      ok=$((ok+1))
+      installed_human="${installed_human}/Overlays/$tag/\n"
+    fi
+    if install_one_dir "$OVERLAYS_ROOT/$res/$tag" "$repo_path" "$cfg_repo_path" "$unique_stem" "$ext"; then
+      ok=$((ok+1))
+      installed_human="${installed_human}/Overlays/$res/$tag/\n"
+    fi
+  done
+
+  [ "$ok" -gt 0 ] || return 1
+  INSTALL_DEST_HUMAN="$installed_human"
   return 0
 }
 
@@ -364,11 +591,17 @@ browse_overlays_for_system() {
   done <"$paths_for_sys"
 
   while :; do
-    chosen_label=$(show_list "$sys ($res)  -  pick overlay" "$labels_for_sys" "PREVIEW" "BACK")
-    rc=$LIST_RC
-    [ $rc -ne 0 ] && return
+    show_list "$sys ($res)  -  pick overlay" "$labels_for_sys" "PREVIEW" "BACK"
+    rc=$?
+    classify_helper_rc "$rc"
+    case "$HELPER_ACTION" in
+      abort) exit "$rc" ;;
+      back)  return ;;
+    esac
 
-    # Translate label back to the repo path by line index
+    chosen_label=$(cat "$LIST_OUT_FILE")
+    [ -z "$chosen_label" ] && continue
+
     idx=$(awk -v sel="$chosen_label" '$0==sel{print NR; exit}' "$labels_for_sys")
     [ -z "$idx" ] && continue
     chosen_path=$(sed -n "${idx}p" "$paths_for_sys")
@@ -380,17 +613,18 @@ browse_overlays_for_system() {
     fi
 
     show_preview "$preview_file" "$chosen_label"
-    case $PREV_RC in
-      4) # INSTALL
+    prev_rc=$?
+    classify_helper_rc "$prev_rc"
+    case "$HELPER_ACTION" in
+      abort) exit "$prev_rc" ;;
+      ok)
         if install_overlay "$chosen_path"; then
-          show_message "Installed to /Overlays/$sys" 2
+          show_message "Installed to:\n${INSTALL_DEST_HUMAN}" 4
         else
           show_message "Install failed" 3
         fi
         ;;
-      *)
-        : # back to overlay list
-        ;;
+      back) : ;;
     esac
   done
 }
@@ -437,9 +671,15 @@ pick_resolution_interactive() {
     show_message "No resolutions available in repo" 3
     return
   fi
-  chosen=$(show_list "Choose resolution (current: $REPO_RES)" "$res_file" "USE" "BACK")
-  rc=$LIST_RC
-  [ $rc -ne 0 ] && return
+  show_list "Choose resolution (current: $REPO_RES)" "$res_file" "USE" "BACK"
+  rc=$?
+  classify_helper_rc "$rc"
+  case "$HELPER_ACTION" in
+    abort) exit "$rc" ;;
+    back)  return ;;
+  esac
+
+  chosen=$(cat "$LIST_OUT_FILE")
   [ -z "$chosen" ] && return
   REPO_RES="$chosen"
   echo "$REPO_RES" > "$RESOLUTION_SETTING_FILE"
@@ -459,9 +699,15 @@ browse_systems() {
     fi
     echo "[Change resolution: $REPO_RES]" >> "$menu_file"
 
-    chosen=$(show_list "Pick a system  (res: $REPO_RES)" "$menu_file" "OPEN" "QUIT")
-    rc=$LIST_RC
-    [ $rc -ne 0 ] && return
+    show_list "Pick a system  (res: $REPO_RES)" "$menu_file" "OPEN" "QUIT"
+    rc=$?
+    classify_helper_rc "$rc"
+    case "$HELPER_ACTION" in
+      abort) exit "$rc" ;;
+      back)  return ;;
+    esac
+
+    chosen=$(cat "$LIST_OUT_FILE")
     [ -z "$chosen" ] && return
 
     case "$chosen" in
